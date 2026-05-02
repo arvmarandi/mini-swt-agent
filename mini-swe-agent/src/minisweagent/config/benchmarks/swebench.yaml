@@ -1,0 +1,290 @@
+agent:
+  system_template: |
+    You are a helpful assistant that can interact with a computer shell to solve programming tasks.
+  system_template_alt: |
+    You are a file filtering assistant. Your only job is to return a list of file paths. Do NOT use any tools. Do NOT format your output as JSON
+  instance_template: |
+    <pr_description>
+    Consider the following PR description:
+    {{task}}
+    </pr_description>
+
+    <pre-localized_context>
+    # Pre-Localized Code Context
+    The following functions have been identified as highly relevant to this issue. 
+    Use these to understand the existing implementation and as a template for your reproduction script.
+
+    {{preprocessed_functions}}
+    </pre-localized_context>
+
+    <instructions>
+    # Task Instructions
+
+    ## Overview
+
+    You're a software engineer interacting continuously with a computer by submitting commands.
+    You'll be helping write tests that expose the bug described in the PR description.
+    Your task is specifically to add test files in the current directory in order to write tests that:
+    1. **Fail** on the current (buggy) codebase
+    2. **Would pass** once the bug described in the PR is correctly fixed
+
+    <IMPORTANT>This is an interactive process where you will think and issue AT LEAST ONE command, see the result, then think and issue your next command(s).</important>
+
+    For each response:
+
+    1. Include a THOUGHT section explaining your reasoning and what you're trying to accomplish
+    2. Provide one or more bash tool calls to execute
+
+    ## Important Boundaries
+
+    - MODIFY: Test files in /testbed (this is the working directory for all your subsequent commands)
+    - DO NOT MODIFY: Source code files, configuration files (pyproject.toml, setup.cfg, etc.)
+
+    ## Recommended Workflow
+
+    1. Read the PR description carefully to identify the buggy behavior
+    2. Read relevant source files to understand the expected vs. actual behavior
+    3. Write unit tests that fail in the current state of the repository but will pass when the issue is resolved. Essentially, you'll want to write a unit test that reproduces the described issue
+    4. Run your test and confirm it fails as expected
+    5. Ensure the test fails for the right reason (the bug).
+
+    ## Command Execution Rules
+
+    You are operating in an environment where
+
+    1. You issue at least one command
+    2. The system executes the command(s) in a subshell
+    3. You see the result(s)
+    4. You write your next command(s)
+
+    Each response should include:
+
+    1. **Reasoning text** where you explain your analysis and plan
+    2. At least one tool call with your command
+
+    **CRITICAL REQUIREMENTS:**
+
+    - Your response SHOULD include reasoning text explaining what you're doing
+    - Your response MUST include AT LEAST ONE bash tool call. You can make MULTIPLE tool calls in a single response when the commands are independent (e.g., searching multiple files, reading different parts of the codebase).
+    - Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
+    - However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
+
+    Example of a CORRECT response:
+    <example_response>
+    The PR describes a bug where `foo()` raises a TypeError on empty input. Let me find the existing tests for `foo` to understand the test conventions and framework used.
+
+    [Makes multiple bash tool calls: {"command": "find /testbed -name 'test_*.py' | xargs grep -l 'foo' 2>/dev/null"}, {"command": "ls /testbed/tests/"}]
+    </example_response>
+
+    ## Environment Details
+
+    - You have a full Linux shell environment
+    - Always use non-interactive flags (-y, -f) for commands
+    - Avoid interactive tools like vi, nano, or any that require user input
+    - You can use bash commands or invoke any tool that is available in the environment
+    - You can also create new tools or scripts to help you with the task
+    - If a tool isn't available, you can also install it
+
+    ## Submission
+
+    When you've completed your work, you MUST submit your changes as a git patch.
+    Follow these steps IN ORDER, with SEPARATE commands:
+
+    Step 1: Create the patch file
+    Run `git diff -- path/to/test_file1 path/to/test_file2 > patch.txt` listing only the test files you modified or created.
+    Do NOT commit your changes.
+    It MUST be a git diff.
+
+    <IMPORTANT>
+    The patch must only contain changes to the test files you wrote or modified.
+    Do not submit changes to any of the following:
+
+    - Source code files (non-test files)
+    - Helper scripts or tools that you created for exploration
+    - Installation, build, packaging, configuration, or setup scripts
+    - Binary or compiled files
+    </IMPORTANT>
+
+    Step 2: Verify your patch
+    Inspect patch.txt to confirm it only contains your intended test changes and headers show `--- a/` and `+++ b/` paths.
+
+    Step 3: Submit (EXACT command required)
+    You MUST use this EXACT command to submit:
+
+    ```bash
+    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt
+    ```
+
+    If the command fails (nonzero exit status), it will not submit.
+
+    <CRITICAL>
+    - Creating/viewing the patch and submitting it MUST be separate commands (not combined with &&).
+    - If you modify patch.txt after verifying, you SHOULD verify again before submitting.
+    - You CANNOT continue working (reading, editing, testing) in any way on this task after submitting.
+    </CRITICAL>
+    </instructions>
+  test_func_loc1: |
+    Suppose you are a very experienced developer. An issue has been created, and you need to choose the best
+    possible test file(s) to write a fail-to-pass test. You will be given two pieces of information. Please write down the
+    test file name(s) after the "Answer" token.
+      1. Issue Description: {{task}}
+      2. List of file(s), that will be updated or added for writing fail-to-pass test:
+    {{list_files}}
+
+    Analyze the provided issue description and write down the 10 most relevant test file names from the list above.
+    Write one file name in each line. Do not add any number or index. Also do not add any explanation.
+
+    <IMPORTANT>
+    You must provide your answer by calling the bash tool with a single echo command.
+    List the 10 file paths separated by newlines inside the echo command.
+
+    Example Tool Call:
+    {"command": "echo 'path/to/file1.py\npath/to/file2.py\n...' "}
+    </IMPORTANT>
+
+    <CRITICAL>
+    You MUST echo 10 file paths, if at least 10 are given.
+    Do NOT use any commands, except for echo. You can only use echo once, so use it to print the relevant file paths.
+    </CRITICAL>
+
+    Answer:
+  test_func_loc2: |
+    Suppose you are a very experienced developer. An issue has been created, and you need to choose the best
+    possible test file to write a fail-to-pass test. You will be given two pieces of information.
+    1. Issue Description: {{task}}
+    2. List of existing test files and functions relevant to this issue:
+    {{list_file_function}}
+
+    Select the most relevant existing test functions to use as reference when writing a new fail-to-pass test.
+    Choose functions that are most similar in structure or subject matter to what the new test should cover.
+    You can choose multiple functions from different files but keep the list as short as possible.
+
+    <IMPORTANT>
+    You MUST provide your answer by calling the bash tool with a single echo command.
+    Format each selection as 'path/to/file.py::ClassName::function_name' for class-based tests,
+    or 'path/to/file.py::function_name' for standalone functions.
+    Only select functions from the provided list. Do not invent new ones.
+    Example Tool Call:
+    {"command": "echo 'tests/test_management.py::CommandTests::test_execute\ntests/test_views.py::ViewTests::test_login'"}
+    </IMPORTANT>
+
+    <CRITICAL>
+    - Do NOT use any commands except echo
+    - Only select from the provided list
+    - Use echo exactly once
+    </CRITICAL>
+    Answer:
+  func_loc1: |
+    Suppose you are a very experienced developer. An issue has been created, and you need to choose the best possible file(s) to make the changes. You will be given two pieces of information. Please write down the file name(s) after the "Answer" token.
+      1. Issue Description: {{task}}
+      2. List of file(s), that will be updated or added for addressing the pull request
+    {{list_files}}
+
+    Analyze the provided issue description and write down the 10 most relevant file names from the list above.
+    Write one file name in each line. Do not add any number or index. Also do not add any explanation.
+
+    <IMPORTANT>
+    You must provide your answer by calling the bash tool with a single echo command.
+    List the 10 file paths separated by newlines inside the echo command.
+
+    Example Tool Call:
+    {"command": "echo 'path/to/file1.py\npath/to/file2.py\n...' "}
+    </IMPORTANT>
+
+    <CRITICAL>
+    You MUST echo 10 file paths, if at least 10 are given.
+    Do NOT use any commands, except for echo. You can only use echo once, so use it to print the relevant file paths.
+    </CRITICAL>
+
+    Answer:
+  func_loc2: |
+    Suppose you are a very experienced developer. An issue has been created, and you need to choose the best possible files and functions to make the changes. You will be given two pieces of information.
+    1. Issue Description: {{task}}
+    2. List of file(s) and function(s), that will be updated or added for addressing the pull request:
+    {{list_file_function}}
+
+    Select the most relevant program files and relevant function names based on the issue description.
+    You can choose multiple functions from different files but keep the list as short as possible.
+
+    <IMPORTANT>
+    You MUST provide your answer by calling the bash tool with a single echo command.
+    Format each selection as 'path/to/file.py::ClassName::function_name' for class-based functions,
+    or 'path/to/file.py::function_name' for standalone functions.
+    Only select functions from the provided list. Do not invent new ones.
+    Example Tool Call:
+    {"command": "echo 'path/to/file1.py::Class1::class1_execute\npath/to/file2.py::Class2::function2"}
+    </IMPORTANT>
+
+    <CRITICAL>
+    - Do NOT use any commands except echo
+    - Only select from the provided list
+    - Use echo exactly once
+    </CRITICAL>
+    Answer:
+Answer:
+  step_limit: 250
+  cost_limit: 3.
+
+environment:
+  cwd: "/testbed"
+  timeout: 180
+  interpreter: ["bash", "-c"]
+  env:
+    PAGER: cat
+    MANPAGER: cat
+    LESS: -R
+    PIP_PROGRESS_BAR: "off"
+    TQDM_DISABLE: "1"
+  environment_class: docker
+
+model:
+  observation_template: |
+    {% if output.exception_info -%}
+    <exception>{{output.exception_info}}</exception>
+    {% endif -%}
+    <returncode>{{output.returncode}}</returncode>
+    {% if output.output | length < 10000 -%}
+    <output>
+    {{ output.output -}}
+    </output>
+    {%- else -%}
+    <warning>
+    The output of your last command was too long.
+    Please try a different command that produces less output.
+    If you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.
+    If you're using grep or find and it produced too much output, you can use a more selective search pattern.
+    If you really need to see something from the full command's output, you can redirect output to a file and then search in that file.
+    </warning>
+    {%- set elided_chars = output.output | length - 10000 -%}
+    <output_head>
+    {{ output.output[:5000] }}
+    </output_head>
+    <elided_chars>
+    {{ elided_chars }} characters elided
+    </elided_chars>
+    <output_tail>
+    {{ output.output[-5000:] }}
+    </output_tail>
+    {%- endif -%}
+  format_error_template: |
+    Tool call error:
+
+    <error>
+    {{error}}
+    </error>
+
+    Here is general guidance on how to submit correct toolcalls:
+
+    Every response needs to use the 'bash' tool at least once to execute commands.
+
+    Call the bash tool with your command as the argument:
+    - Tool: bash
+    - Arguments: {"command": "your_command_here"}
+
+    If you have completed your assignment, please consult the first message about how to
+    submit your solution (you will not be able to continue working on this task after that).
+  model_name: "anthropic/claude-sonnet-4-5-20250929"
+  model_kwargs:
+    drop_params: true
+    temperature: 0.0
+    parallel_tool_calls: true

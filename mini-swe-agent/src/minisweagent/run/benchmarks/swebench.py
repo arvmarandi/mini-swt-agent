@@ -1,0 +1,603 @@
+#!/usr/bin/env python3
+
+"""Run mini-SWE-agent on SWE-bench instances in batch mode."""
+# Read this first: https://mini-swe-agent.com/latest/usage/swebench/  (usage docs)
+
+import concurrent.futures
+import json
+import random
+import re
+import threading
+import time
+import traceback
+from pathlib import Path
+import difflib
+
+import typer
+from jinja2 import StrictUndefined, Template
+from rich.live import Live
+
+from minisweagent import Environment
+from minisweagent.agents.default import DefaultAgent
+from minisweagent.config import builtin_config_dir, get_config_from_spec
+from minisweagent.environments import get_environment
+from minisweagent.models import get_model
+from minisweagent.run.benchmarks.utils.batch_progress import RunBatchProgressManager
+from minisweagent.utils.log import add_file_handler, logger
+from minisweagent.utils.serialize import UNSET, recursive_merge
+
+_HELP_TEXT = """Run mini-SWE-agent on SWEBench instances.
+
+[not dim]
+More information about the usage: [bold green]https://mini-swe-agent.com/latest/usage/swebench/[/bold green]
+[/not dim]
+"""
+
+_CONFIG_SPEC_HELP_TEXT = """Path to config files, filenames, or key-value pairs.
+
+[bold red]IMPORTANT:[/bold red] [red]If you set this option, the default config file will not be used.[/red]
+So you need to explicitly set it e.g., with [bold green]-c swebench.yaml <other options>[/bold green]
+
+Multiple configs will be recursively merged.
+
+Examples:
+
+[bold red]-c model.model_kwargs.temperature=0[/bold red] [red]You forgot to add the default config file! See above.[/red]
+
+[bold green]-c swebench.yaml -c model.model_kwargs.temperature=0.5[/bold green]
+
+[bold green]-c swebench.yaml -c agent.max_iterations=50[/bold green]
+"""
+
+DEFAULT_CONFIG_FILE = builtin_config_dir / "benchmarks" / "swebench.yaml"
+
+DATASET_MAPPING = {
+    "full": "princeton-nlp/SWE-Bench",
+    "verified": "princeton-nlp/SWE-Bench_Verified",
+    "lite": "princeton-nlp/SWE-Bench_Lite",
+    "multimodal": "princeton-nlp/SWE-Bench_Multimodal",
+    "multilingual": "swe-bench/SWE-Bench_Multilingual",
+    "smith": "SWE-bench/SWE-smith",
+    "_test": "klieret/swe-bench-dummy-test-dataset",
+    "rebench": "nebius/SWE-rebench",
+}
+
+app = typer.Typer(rich_markup_mode="rich", add_completion=False)
+_OUTPUT_FILE_LOCK = threading.Lock()
+
+
+class ProgressTrackingAgent(DefaultAgent):
+    """Simple wrapper around DefaultAgent that provides progress updates."""
+
+    def __init__(self, *args, progress_manager: RunBatchProgressManager, instance_id: str = "", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.progress_manager: RunBatchProgressManager = progress_manager
+        self.instance_id = instance_id
+
+    def step(self) -> dict:
+        """Override step to provide progress updates."""
+        self.progress_manager.update_instance_status(self.instance_id, f"Step {self.n_calls + 1:3d} (${self.cost:.2f})")
+        return super().step()
+
+
+def get_swebench_docker_image_name(instance: dict) -> str:
+    """Get the image name for a SWEBench instance."""
+    image_name = instance.get("image_name", None) or instance.get("docker_image", None)
+    if image_name is None:
+        # Docker doesn't allow double underscore, so we replace them with a magic token
+        iid = instance["instance_id"]
+        id_docker_compatible = iid.replace("__", "_1776_")
+        image_name = f"docker.io/swebench/sweb.eval.x86_64.{id_docker_compatible}:latest".lower()
+    return image_name
+
+
+def get_sb_environment(config: dict, instance: dict) -> Environment:
+    env_config = config.setdefault("environment", {})
+    env_config["environment_class"] = env_config.get("environment_class", "docker")
+    image_name = get_swebench_docker_image_name(instance)
+    if env_config["environment_class"] in ["docker", "swerex_modal"]:
+        env_config["image"] = image_name
+    elif env_config["environment_class"] in ["singularity", "contree"]:
+        env_config["image"] = "docker://" + image_name
+
+    env = get_environment(env_config)
+    if startup_command := config.get("run", {}).get("env_startup_command"):
+        startup_command = Template(startup_command, undefined=StrictUndefined).render(**instance)
+        out = env.execute(startup_command)
+        if out["returncode"] != 0:
+            raise RuntimeError(f"Error executing startup command: {out}")
+    return env
+
+
+def update_preds_file(output_path: Path, instance_id: str, model_name: str, result: str):
+    """Update the output JSON file with results from a single instance."""
+    with _OUTPUT_FILE_LOCK:
+        output_data = {}
+        if output_path.exists():
+            output_data = json.loads(output_path.read_text())
+        output_data[instance_id] = {
+            "model_name_or_path": model_name,
+            "instance_id": instance_id,
+            "model_patch": result,
+        }
+        output_path.write_text(json.dumps(output_data, indent=2))
+
+
+def remove_from_preds_file(output_path: Path, instance_id: str):
+    """Remove an instance from the predictions file."""
+    if not output_path.exists():
+        return
+    with _OUTPUT_FILE_LOCK:
+        output_data = json.loads(output_path.read_text())
+        if instance_id in output_data:
+            del output_data[instance_id]
+            output_path.write_text(json.dumps(output_data, indent=2))
+
+
+def process_instance(
+    instance: dict,
+    output_dir: Path,
+    config: dict,
+    progress_manager: RunBatchProgressManager,
+) -> None:
+    """Process a single SWEBench instance."""
+    instance_id = instance["instance_id"]
+    instance_dir = output_dir / instance_id
+    # avoid inconsistent state if something here fails and there's leftover previous files
+    remove_from_preds_file(output_dir / "preds.json", instance_id)
+    (instance_dir / f"{instance_id}.traj.json").unlink(missing_ok=True)
+    model = get_model(config=config.get("model", {}))
+    task = instance["problem_statement"]
+
+    progress_manager.on_instance_start(instance_id)
+    progress_manager.update_instance_status(instance_id, "Pulling/starting environment")
+
+    agent = None
+    exit_status = None
+    result = None
+    extra_info = {}
+
+    try:
+        env = get_sb_environment(config, instance)
+        agent = ProgressTrackingAgent(
+            model,
+            env,
+            progress_manager=progress_manager,
+            instance_id=instance_id,
+            **config.get("agent", {}),
+        )
+
+
+        # PART 1: Focal Function Localization
+        prog_files = find_program_files(env)
+        llm_prog_files = None # prompt llm to retrieve relevant files 
+
+        # validation loop
+        for i in range(5): # 5 iterations, at most 
+            # prompt llm to retrieve relevant file
+            llm_prog_files = agent.run_func_loc1(task, prog_files)
+
+            # validate the paths
+            llm_prog_files = llm_prog_files.replace('\\\\n', '\n').replace('\\n', '\n').strip().rstrip('\\').strip("'\"")
+            llm_prog_files = [f.strip(' "\'').strip() for f in llm_prog_files.split('\n') if f.strip()]
+
+            if (len(prog_files) >= 10 and len(llm_prog_files) == 10) or len(prog_files) < 10: # make sure that K files are produced
+                break
+
+        validated_prog_files = []
+        for file_path in llm_prog_files:
+            val_path = find_closest_paths(file_path, prog_files)
+            if val_path:
+                validated_prog_files.append(val_path)
+
+        # find all the functions in the selected files
+        prog_functions = find_functions(env, validated_prog_files)
+
+        # prompt llmn to retrieve relevant functions
+        prog_function_paths = agent.run_func_loc2(task, prog_functions) 
+        
+
+        # PART 2: Test Function Localization
+        # files with tests in them
+        test_files = find_test_files(env)
+        llm_test_files = None
+
+        # validation loop
+        for i in range(5): # 5 iterations, at most 
+            # prompt llm to retrieve relevant file
+            llm_test_files = agent.run_test_func_loc1(task, test_files)
+
+            # validate the paths
+            llm_test_files = llm_test_files.replace('\\\\n', '\n').replace('\\n', '\n').strip().rstrip('\\').strip("'\"")
+            llm_test_files = [f.strip(' "\'').strip() for f in llm_test_files.split('\n') if f.strip()]
+
+            if (len(test_files) >= 10 and len(llm_test_files) == 10) or len(test_files) < 10: # make sure that K files are produced
+                break
+
+        validated_files = []
+        for file_path in llm_test_files:
+            val_path = find_closest_paths(file_path, test_files)
+            if val_path:
+                validated_files.append(val_path)
+
+        # find all the functions in the selected files
+        test_functions = find_test_functions(env, validated_files)
+
+        # prompt llmn to retrieve relevant functions
+        test_function_paths = agent.run_test_func_loc2(task, test_functions)
+
+        # PART 3: Test Generation
+        prog_bodies = get_function_bodies(env, prog_function_paths)
+        test_bodies = get_function_bodies(env, test_function_paths)
+
+        info = agent.run(task, prog_bodies + test_bodies)
+        exit_status = info.get("exit_status")
+        result = info.get("submission")
+
+    except Exception as e:
+        logger.error(f"Error processing instance {instance_id}: {e}", exc_info=True)
+        exit_status, result = type(e).__name__, ""
+        extra_info = {"traceback": traceback.format_exc(), "exception_str": str(e)}
+    finally:
+        if agent is not None:
+            traj_path = instance_dir / f"{instance_id}.traj.json"
+            agent.save(
+                traj_path,
+                {
+                    "info": {
+                        "exit_status": exit_status,
+                        "submission": result,
+                        **extra_info,
+                    },
+                    "instance_id": instance_id,
+                },
+            )
+            logger.info(f"Saved trajectory to '{traj_path}'")
+        update_preds_file(output_dir / "preds.json", instance_id, model.config.model_name, result)
+        progress_manager.on_instance_end(instance_id, exit_status)
+
+
+def filter_instances(
+    instances: list[dict], *, filter_spec: str, slice_spec: str = "", shuffle: bool = False, limit: int = 0
+) -> list[dict]:
+    """Filter and slice a list of SWEBench instances."""
+    if shuffle:
+        instances = sorted(instances.copy(), key=lambda x: x["instance_id"])
+        random.seed(42)
+        random.shuffle(instances)
+    before_filter = len(instances)
+    instances = [instance for instance in instances if re.match(filter_spec, instance["instance_id"])]
+    if (after_filter := len(instances)) != before_filter:
+        logger.info(f"Instance filter: {before_filter} -> {after_filter} instances")
+    if slice_spec:
+        values = [int(x) if x else None for x in slice_spec.split(":")]
+        instances = instances[slice(*values)]
+        if (after_slice := len(instances)) != before_filter:
+            logger.info(f"Instance slice: {before_filter} -> {after_slice} instances")
+    if limit > 0 and len(instances) > limit:
+        instances = instances[:limit]
+        logger.info(f"Instance limit: {limit} (final {len(instances)} instances)")
+    return instances
+
+
+def select_instances(instances: list[dict], *, instance_ids: str = "") -> list[dict]:
+    """Select a subset of instances by comma-separated IDs and/or indices."""
+    if instance_ids:
+        ids = {item.strip() for item in instance_ids.split(",") if item.strip()}
+        instances = [instance for instance in instances if instance["instance_id"] in ids]
+        logger.info(f"Instance IDs selector reduced to {len(instances)} instances")
+    return instances
+
+# return all the program files in the repository
+def find_program_files(env: Environment, exclude_test_files: bool = False) -> list[str]:
+    program_files = set()
+    test_files = set()
+    
+    # If excluding test files, first find all test files
+    if exclude_test_files:
+        test_files = set(find_test_files(env))
+    
+    # Find all Python files in the repository
+    try:
+        out = env.execute({"command": "find /testbed -type f -name '*.py' 2>/dev/null | head -200"})
+        if out["returncode"] == 0:
+            all_files = out["output"].strip().split("\n")
+            program_files.update(all_files)
+    except Exception:
+        pass
+    
+    # clean up and filter results
+    program_files = {f for f in program_files if f.strip() and f.startswith("/testbed/")}
+    program_files = {f.replace("/testbed/", "") for f in program_files if f}
+    
+    # exclude test files if requested
+    if exclude_test_files:
+        program_files = program_files - test_files
+    
+    # Remove empty strings and sort
+    result = sorted(list(program_files))
+    return result
+
+
+def find_test_files(env: Environment) -> list[str]:
+    test_files = set()
+
+    # find files in test directories
+    try:
+        out = env.execute({"command": "find /testbed -type f -path '*/test*' -name '*.py' 2>/dev/null | head -50"})
+        if out["returncode"] == 0:
+            test_files.update(out["output"].strip().split("\n"))
+    except Exception:
+        pass
+
+    # find files with 'test' in filename
+    try:
+        out = env.execute({"command": "find /testbed -type f -name '*test*.py' 2>/dev/null | head -50"})
+        if out["returncode"] == 0:
+            test_files.update(out["output"].strip().split("\n"))
+    except Exception:
+        pass
+
+    # find Python files containing test patterns
+    try:
+        out = env.execute(
+            {
+                "command": "find /testbed -type f -name '*.py' -exec grep -E -l 'def test_|class Test' {} \\; 2>/dev/null | head -50"
+            }
+        )
+        if out["returncode"] == 0:
+            test_files.update(out["output"].strip().split("\n"))
+    except Exception:
+        pass
+
+    # clean the paths
+    test_files = {f for f in test_files if f.strip() and f.startswith("/testbed/")}
+    test_files = {f.replace("/testbed/", "") for f in test_files if f}
+
+    result = sorted(list(test_files))
+    return result
+
+
+def find_test_functions(env: Environment, test_files: list[str]) -> list[str]:
+    test_functions = []
+    for file_path in test_files:
+        if not file_path.strip():
+            continue
+        
+        file_path = file_path.lstrip('/')
+        full_path = f"/testbed/{file_path}"
+        
+        try:
+            out = env.execute({"command": f"grep -n 'def test_' '{full_path}' 2>/dev/null || true"})
+            if out["returncode"] == 0 and out["output"].strip():
+                current_class = None
+                # get class context too
+                full_out = env.execute({"command": f"grep -n 'class \|def test_' '{full_path}' 2>/dev/null || true"})
+                for line in full_out["output"].strip().split("\n"):
+                    content = line.split(":", 1)[-1] if ":" in line else line
+                    if "class " in content and not content.strip().startswith("def"):
+                        current_class = content.strip().split("class ")[1].split("(")[0].strip()
+                    elif "def test_" in content:
+                        func_name = content.strip()[4:content.strip().index("(")].strip()
+                        if current_class:
+                            test_functions.append(f"{file_path}::{current_class}::{func_name}")
+                        else:
+                            test_functions.append(f"{file_path}::{func_name}")
+        except Exception as e:
+            print(f"Error processing {file_path}: {e}")
+            continue
+    
+    return sorted(test_functions)
+
+
+def find_functions(env: Environment, file_paths: list[str]) -> list[str]:
+    functions = []
+    for file_path in file_paths:
+        if not file_path.strip():
+            continue
+        file_path = file_path.lstrip('/')
+        full_path = f"/testbed/{file_path}"
+
+        script = f"""import ast
+with open('{full_path}') as f:
+    source = f.read()
+tree = ast.parse(source)
+file_path = '{file_path}'
+for node in tree.body:
+    if isinstance(node, ast.ClassDef):
+        for item in node.body:
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                print(f"{{file_path}}::{{node.name}}::{{item.name}}")
+    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        print(f"{{file_path}}::{{node.name}}")
+"""
+        try:
+            # Write script to temp file and execute
+            env.execute({"command": f"cat > /tmp/extract_funcs.py << 'PYEOF'\n{script}\nPYEOF"})
+            out = env.execute({"command": "python3 /tmp/extract_funcs.py"})
+            if out.get("output", "").strip():
+                for line in out["output"].strip().split("\n"):
+                    if line.strip():
+                        functions.append(line.strip())
+        except Exception as e:
+            print(f"Error processing {file_path}: {e}")
+            continue
+
+    return sorted(functions)
+
+def find_closest_paths(llm_guess, all_repo_files):
+    # 1. pre-process: LLMs often use dots (astropy.modeling.core) instead of slashes
+    clean_guess = llm_guess.replace('.', '/').strip()
+    if not clean_guess.endswith('.py') and '/' in clean_guess:
+        clean_guess += '.py'
+
+    # 2. happy path
+    if clean_guess in all_repo_files:
+        return clean_guess
+
+    # 3. Levenshtein distance
+    # cutoff=0.6 is a good balance for "close enough"
+    matches = difflib.get_close_matches(clean_guess, all_repo_files, n=1, cutoff=0.6)
+    
+    if matches:
+        return matches[0]
+
+    # 4. if the path is wrong, but the filename is unique in the repo
+    llm_filename = clean_guess.split('/')[-1]
+    filename_matches = [f for f in all_repo_files if f.endswith(llm_filename)]
+    
+    if len(filename_matches) == 1:
+        return filename_matches[0]
+
+    return None # Truly not found
+
+def get_function_body(env, signature: str) -> str:
+    parts = signature.split("::")
+    if len(parts) == 2:
+        file_path, func_name = parts
+    elif len(parts) == 3:
+        file_path, _, func_name = parts
+    else:
+        return ""
+
+    full_path = f"/testbed/{file_path}"
+
+    # find the line number of the function definition
+    find_obs = env.execute({
+        "command": f"grep -n 'def {func_name}' '{full_path}' 2>/dev/null | head -1"
+    })
+    line_str = find_obs.get("output", "").split(":")[0].strip()
+    if not line_str.isdigit():
+        return ""
+
+    start_line = int(line_str)
+
+    # extract the function body using the AST
+    extract_cmd = f"""python3 - <<'EOF'
+import ast, sys
+
+with open('{full_path}') as f:
+    source = f.read()
+
+tree = ast.parse(source)
+lines = source.splitlines()
+
+for node in ast.walk(tree):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if node.name == '{func_name}' and node.lineno == {start_line}:
+            print('\\n'.join(lines[node.lineno - 1:node.end_lineno]))
+            sys.exit(0)
+EOF"""
+
+    body_obs = env.execute({"command": extract_cmd})
+    return body_obs.get("output", "").strip()
+
+
+def get_function_bodies(env, signatures_raw: str) -> str:
+    normalized = signatures_raw.replace('\\n', '\n').replace('\\\\n', '\n') # stupid LLM hallucinates backslashes for newline characters
+    signatures = [s.strip() for s in normalized.split("\n") if "::" in s]
+    if not signatures:
+        return ""
+
+    results = []
+    for sig in signatures:
+        body = get_function_body(env, sig)
+        if body:
+            results.append(f"--- {sig} ---\n{body}")
+
+    return "\n\n".join(results)
+
+# fmt: off
+@app.command(help=_HELP_TEXT)
+def main(
+    subset: str = typer.Option("lite", "--subset", help="SWEBench subset to use or path to a dataset", rich_help_panel="Data selection"),
+    split: str = typer.Option("dev", "--split", help="Dataset split", rich_help_panel="Data selection"),
+    slice_spec: str = typer.Option("", "--slice", help="Slice specification (e.g., '0:5' for first 5 instances)", rich_help_panel="Data selection"),
+    filter_spec: str = typer.Option("", "--filter", help="Filter instance IDs by regex", rich_help_panel="Data selection"),
+    shuffle: bool = typer.Option(False, "--shuffle", help="Shuffle instances", rich_help_panel="Data selection"),
+    max_instances: int = typer.Option(0, "--max-instances", help="Maximum number of instances to process (0 means no limit)", rich_help_panel="Data selection"),
+    instance_ids: str = typer.Option("", "--instance-ids", help="Comma-separated instance_id values to run", rich_help_panel="Data selection"),
+    output: str = typer.Option("", "-o", "--output", help="Output directory", rich_help_panel="Basic"),
+    workers: int = typer.Option(1, "-w", "--workers", help="Number of worker threads for parallel processing", rich_help_panel="Basic"),
+    model: str | None = typer.Option(None, "-m", "--model", help="Model to use", rich_help_panel="Basic"),
+    model_class: str | None = typer.Option(None, "--model-class", help="Model class to use (e.g., 'anthropic' or 'minisweagent.models.anthropic.AnthropicModel')", rich_help_panel="Advanced"),
+    redo_existing: bool = typer.Option(False, "--redo-existing", help="Redo existing instances", rich_help_panel="Data selection"),
+    config_spec: list[str] = typer.Option([str(DEFAULT_CONFIG_FILE)], "-c", "--config", help=_CONFIG_SPEC_HELP_TEXT, rich_help_panel="Basic"),
+    environment_class: str | None = typer.Option(None, "--environment-class", help="Environment type to use. Recommended are docker or singularity", rich_help_panel="Advanced"),
+) -> None:
+    # fmt: on
+    output_path = Path(output)
+    output_path.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Results will be saved to {output_path}")
+    add_file_handler(output_path / "minisweagent.log")
+
+    from datasets import load_dataset
+
+    dataset_path = DATASET_MAPPING.get(subset, subset)
+    logger.info(f"Loading dataset {dataset_path}, split {split}...")
+    instances = list(load_dataset(dataset_path, split=split))
+
+    # When main is called directly (not via CLI), Typer parameters are OptionInfo objects.
+    if hasattr(max_instances, "default"):
+        max_instances = max_instances.default
+    if hasattr(instance_ids, "default"):
+        instance_ids = instance_ids.default
+
+    instances = filter_instances(
+        instances,
+        filter_spec=filter_spec,
+        slice_spec=slice_spec,
+        shuffle=shuffle,
+        limit=max_instances,
+    )
+    if not redo_existing and (output_path / "preds.json").exists():
+        existing_instances = list(json.loads((output_path / "preds.json").read_text()).keys())
+        logger.info(f"Skipping {len(existing_instances)} existing instances")
+        instances = [instance for instance in instances if instance["instance_id"] not in existing_instances]
+
+    if instance_ids:
+        instances = select_instances(instances, instance_ids=instance_ids)
+
+    logger.info(f"Running on {len(instances)} instances...")
+
+    logger.info(f"Building agent config from specs: {config_spec}")
+    configs = [get_config_from_spec(spec) for spec in config_spec]
+    configs.append({
+        "environment": {"environment_class": environment_class or UNSET},
+        "model": {"model_name": model or UNSET, "model_class": model_class or UNSET},
+    })
+    config = recursive_merge(*configs)
+
+    progress_manager = RunBatchProgressManager(len(instances), output_path / f"exit_statuses_{time.time()}.yaml")
+
+    def process_futures(futures: dict[concurrent.futures.Future, str]):
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()
+            except concurrent.futures.CancelledError:
+                pass
+            except Exception as e:
+                instance_id = futures[future]
+                logger.error(f"Error in future for instance {instance_id}: {e}", exc_info=True)
+                progress_manager.on_uncaught_exception(instance_id, e)
+
+    with Live(progress_manager.render_group, refresh_per_second=4):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(process_instance, instance, output_path, config, progress_manager): instance[
+                    "instance_id"
+                ]
+                for instance in instances
+            }
+            try:
+                process_futures(futures)
+            except KeyboardInterrupt:
+                logger.info("Cancelling all pending jobs. Press ^C again to exit immediately.")
+                for future in futures:
+                    if not future.running() and not future.done():
+                        future.cancel()
+                process_futures(futures)
+
+
+if __name__ == "__main__":
+    app()
