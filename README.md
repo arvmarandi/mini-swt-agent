@@ -41,6 +41,8 @@ Evalution results:
 | Dataset            | Results                                                      |
 |--------------------|------------------------------------------------------------------|
 | SWT-bench Lite     | `results/swt-bench-results.json`     |
+
+![Resolutions per repo](images/repo-resolutions.png)
 ## Acknowledgements
 
  - [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent)
